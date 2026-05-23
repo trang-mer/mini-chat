@@ -25,11 +25,6 @@
 // ============================================================
 // Network helpers
 // ============================================================
-
-// Gửi đầy đủ N bytes qua socket (khắc phục partial send)
-// send() có thể gửi ÍT hơn số bytes yêu cầu
-// Hàm này đảm bảo GỬI HẾT hoặc báo lỗi
-// Trả về: số bytes đã gửi, hoặc SOCKET_ERROR
 [[nodiscard]] inline int sendAll(SOCKET s, const char* data, int len) {
     int totalSent = 0;
     while (totalSent < len) {
@@ -39,20 +34,12 @@
     }
     return totalSent;
 }
-
-// Gửi message theo protocol [length][payload]
-// Đảm bảo cả header + payload được gửi đầy đủ
-// Trả về: true nếu gửi thành công
 inline bool sendMessage(SOCKET s, MessageType type, const std::string& payload) {
     std::string packed = packMessage(type, payload);
     int sent = sendAll(s, packed.data(), static_cast<int>(packed.size()));
     return sent != SOCKET_ERROR;
 }
 
-// Nhận đầy đủ N bytes từ socket (khắc phục partial recv)
-// recv() có thể nhận ÍT hơn số bytes yêu cầu
-// Hàm này đảm bảo NHẬN ĐỦ hoặc báo lỗi/disconnect
-// Trả về: số bytes đã nhận, 0 = disconnect, SOCKET_ERROR = lỗi
 [[nodiscard]] inline int recvAll(SOCKET s, char* buffer, int len) {
     int totalRecv = 0;
     while (totalRecv < len) {
@@ -64,10 +51,6 @@ inline bool sendMessage(SOCKET s, MessageType type, const std::string& payload) 
     return totalRecv;
 }
 
-// Nhận 1 message theo protocol
-// Bước 1: đọc header (5 bytes: 1 type + 4 length)
-// Bước 2: đọc payload (length bytes)
-// Trả về: Message rỗng nếu lỗi/disconnect
 [[nodiscard]] inline Message receiveMessage(SOCKET s) {
     Message result;
 
@@ -133,8 +116,6 @@ inline bool sendMessage(SOCKET s, MessageType type, const std::string& payload) 
 // ============================================================
 // Time helpers
 // ============================================================
-
-// Lấy thời gian hiện tại dạng chuỗi
 [[nodiscard]] inline std::string currentTimeString() {
     auto now  = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
@@ -147,8 +128,6 @@ inline bool sendMessage(SOCKET s, MessageType type, const std::string& payload) 
 // ============================================================
 // Winsock helpers
 // ============================================================
-
-// Lấy mô tả lỗi Winsock
 [[nodiscard]] inline std::string wsaErrorString(int errorCode) {
     char* msgBuf = nullptr;
     FormatMessageA(
@@ -196,4 +175,4 @@ inline bool sendMessage(SOCKET s, MessageType type, const std::string& payload) 
     return {cmd, args};
 }
 
-#endif // UTILS_H
+#endif 
