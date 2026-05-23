@@ -1,0 +1,32 @@
+# Executables
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Build outputs
+Debug/
+Release/
+build/
+*.o
+*.obj
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+server.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak

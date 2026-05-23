@@ -1,133 +1,140 @@
 // ============================================================
 // server/client_handler.cpp
 // Implementation của ClientHandler
+//
+// Features:
+//   - Chờ user nhập nickname khi vừa connect
+//   - Xử lý /users, /join, /msg, /quit commands
+//   - Broadcast tin nhắn trong room
+//   - Thread-safe với mutex cho nickname/room
 // ============================================================
 
 #include "client_handler.h"
+#include "server.h"
 #include "../common/socket_wrapper.h"
 
 // ============================================================
 // Constructor
 // ============================================================
-ClientHandler::ClientHandler(
-    SOCKET                 socket,
-    BroadcastCallback      broadcast,
-    UnregisterCallback     unregister,
-    ListCallback           list
-)
+ClientHandler::ClientHandler(SOCKET socket, std::shared_ptr<ServerBridge> bridge)
     : socket_(socket)
+    , bridge_(bridge)
     , nickname_()
-    , ip_()
-    , port_(0)
-    , connectTime_(0)
-    , running_(true)
-    , broadcastCallback_(std::move(broadcast))
-    , unregisterCallback_(std::move(unregister))
-    , listCallback_(std::move(list))
+    , room_(Config::DEFAULT_ROOM)
+    , running_(false)
 {
-    // Lấy thông tin IP và port
-    struct sockaddr_in addr;
-    int addrLen = sizeof(addr);
-    if (getpeername(socket_, (struct sockaddr*)&addr, &addrLen) == 0) {
-        char ipBuf[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
-        ip_   = ipBuf;
-        port_ = ntohs(addr.sin_port);
-    } else {
-        ip_   = "unknown";
-        port_ = 0;
-    }
-
-    connectTime_ = time(nullptr);
-
-    // Tạo nickname mặc định: "IP:port"
-    nickname_ = ip_ + ":" + std::to_string(port_);
 }
 
 // ============================================================
 // start: bắt đầu xử lý client trong thread riêng
 // ============================================================
 void ClientHandler::start() {
-    // Chạy vòng lặp nhận message
     run();
 }
 
 // ============================================================
-// stop: dừng xử lý (gọi từ thread khác)
+// stop: dừng xử lý
 // ============================================================
 void ClientHandler::stop() {
     running_ = false;
-    // Đóng socket để recv() trong run() trả về
-    shutdown(socket_, SD_BOTH);
-    closesocket(socket_);
+    // Đóng socket
+    if (socket_ != INVALID_SOCKET) {
+        ::shutdown(socket_, SD_BOTH);
+        closesocket(socket_);
+        socket_ = INVALID_SOCKET;
+    }
 }
 
 // ============================================================
-// setNickname: đặt nickname mới
+// getNickname: lấy nickname (thread-safe)
 // ============================================================
-void ClientHandler::setNickname(const std::string& name) {
-    std::string oldNick = nickname_;
-    nickname_ = name;
-    LOG_INFO("Client {} renamed to '{}'", oldNick, nickname_);
+std::string ClientHandler::getNickname() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    return nickname_;
+}
+
+// ============================================================
+// getRoom: lấy room hiện tại (thread-safe)
+// ============================================================
+std::string ClientHandler::getRoom() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    return room_;
+}
+
+// ============================================================
+// hasNickname: kiểm tra đã có nickname chưa
+// ============================================================
+bool ClientHandler::hasNickname() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    return !nickname_.empty();
+}
+
+// ============================================================
+// isRunning: kiểm tra còn đang chạy không
+// ============================================================
+bool ClientHandler::isRunning() const {
+    return running_.load();
 }
 
 // ============================================================
 // run: vòng lặp nhận message từ client
 // ============================================================
 void ClientHandler::run() {
-    LOG_INFO("Client handler started for {}", nickname_);
+    running_ = true;
 
-    // Gửi thông báo chào mừng
+    // Bước 1: Chờ user nhập nickname
+    bool gotNickname = waitForNickname();
+    if (!gotNickname) {
+        // Client disconnect trước khi nhập nickname
+        cleanupAndRemove();
+        return;
+    }
+
+    // Bước 2: Gửi thông báo chào mừng
     std::string welcome =
         "=== Welcome to Mini Chat C++ ===\n"
         "Commands:\n"
-        "  /nick <name>  - Set your nickname\n"
-        "  /list        - List all connected users\n"
-        "  /help        - Show this help\n"
-        "  /quit        - Disconnect\n"
-        "Type a message to broadcast to all users.\n";
+        "  /users       - List online users\n"
+        "  /join <room> - Join a room\n"
+        "  /msg <nick> <msg> - Send private message\n"
+        "  /nick <name> - Change nickname\n"
+        "  /quit        - Disconnect\n\n"
+        "You are in room: " + getRoom() + "\n\n";
     sendMessage(socket_, MessageType::SYSTEM, welcome);
 
-    // Thông báo cho tất cả client khác biết có người mới
-    broadcastCallback_(socket_, MessageType::SYSTEM,
-                       nickname_ + " has joined the chat.", INVALID_SOCKET);
+    // Bước 3: Broadcast user joined (nếu có bridge)
+    if (auto bridge = bridge_.lock()) {
+        bridge->broadcastRoomJoin(getNickname(), getRoom());
+    }
 
-    // Vòng lặp chính: nhận message
-    while (running_) {
-        // Sử dụng select() để kiểm tra non-blocking
-        // Đây là cách an toàn để thoát khỏi recv() blocking
+    // Bước 4: Vòng lặp nhận message
+    while (running_.load()) {
+        // Non-blocking recv với select()
         fd_set readSet;
         FD_ZERO(&readSet);
         FD_SET(socket_, &readSet);
 
         struct timeval timeout;
-        timeout.tv_sec  = 1;   // Check mỗi 1 giây
+        timeout.tv_sec  = 1;
         timeout.tv_usec = 0;
 
         int ready = select(0, &readSet, nullptr, nullptr, &timeout);
         if (ready == SOCKET_ERROR) {
-            LOG_ERROR("select() failed: {}", wsaErrorString(WSAGetLastError()));
             break;
         }
         if (ready == 0) {
-            // Timeout -> tiếp tục vòng lặp
             continue;
         }
 
-        // Có dữ liệu để đọc
+        // Nhận message
         Message msg = receiveMessage(socket_);
         if (msg.payload.empty() && msg.type == MessageType::NORMAL) {
-            // receiveMessage trả về message rỗng = lỗi hoặc disconnect
-            LOG_INFO("Client {} disconnected (recv returned empty)", nickname_);
+            // Disconnect hoặc lỗi
             break;
         }
 
         // Xử lý message
         switch (msg.type) {
-            case MessageType::NORMAL: {
-                handleNormalMessage(msg.payload);
-                break;
-            }
             case MessageType::COMMAND: {
                 bool shouldQuit = handleCommand(msg.payload);
                 if (shouldQuit) {
@@ -135,95 +142,221 @@ void ClientHandler::run() {
                 }
                 break;
             }
+            case MessageType::NORMAL:
             default:
-                LOG_WARNING("Unknown message type {} from {}", static_cast<int>(msg.type), nickname_);
+                // Tin nhắn thường: broadcast trong room
+                handleNormalMessage(msg.payload);
                 break;
         }
     }
 
     // Cleanup khi disconnect
-    LOG_INFO("Cleaning up client {}", nickname_);
+    cleanupAndRemove();
+}
 
-    // Thông báo cho các client khác biết người này đã rời đi
-    broadcastCallback_(socket_, MessageType::SYSTEM,
-                       nickname_ + " has left the chat.", INVALID_SOCKET);
+// ============================================================
+// waitForNickname: chờ user nhập nickname
+// Trả về: true = nhận được nickname, false = client disconnect
+// ============================================================
+bool ClientHandler::waitForNickname() {
+    // Gửi prompt yêu cầu nhập nickname
+    sendMessage(socket_, MessageType::SYSTEM, "Enter your nickname: ");
 
-    // Đóng socket và yêu cầu unregister
-    closesocket(socket_);
-    unregisterCallback_(socket_);
+    // Non-blocking recv để nhận nickname
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(socket_, &readSet);
 
-    LOG_INFO("Client handler finished for {}", nickname_);
+    struct timeval timeout;
+    timeout.tv_sec  = 30;  // Timeout 30 giây để nhập nickname
+    timeout.tv_usec = 0;
+
+    int ready = select(0, &readSet, nullptr, nullptr, &timeout);
+    if (ready == SOCKET_ERROR) {
+        return false;
+    }
+    if (ready == 0) {
+        // Timeout
+        sendMessage(socket_, MessageType::SYSTEM, "Timeout waiting for nickname. Goodbye!");
+        return false;
+    }
+
+    // Nhận nickname
+    Message msg = receiveMessage(socket_);
+    if (msg.payload.empty() && msg.type == MessageType::NORMAL) {
+        return false;
+    }
+
+    // Parse nickname
+    std::string nickname = trim(msg.payload);
+    if (nickname.empty() || nickname.length() > Config::MAX_NICKNAME_LEN) {
+        sendMessage(socket_, MessageType::SYSTEM,
+                    "Invalid nickname. Disconnecting.");
+        return false;
+    }
+
+    // Kiểm tra nickname đã tồn tại chưa
+    if (auto bridge = bridge_.lock()) {
+        if (bridge->nicknameExists(nickname, socket_)) {
+            std::string err = "Nickname '" + nickname + "' is already taken. Disconnecting.";
+            sendMessage(socket_, MessageType::SYSTEM, err);
+            return false;
+        }
+    }
+
+    // Đặt nickname
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        nickname_ = nickname;
+    }
+
+    // Xác nhận
+    std::string confirm = "Your nickname is: " + nickname
+                       + "\nRoom: " + getRoom()
+                       + "\n\nType /help to see available commands.\n";
+    sendMessage(socket_, MessageType::SYSTEM, confirm);
+
+    return true;
 }
 
 // ============================================================
 // handleCommand: xử lý lệnh từ client
+// Trả về: true = tiếp tục, false = ngắt kết nối
 // ============================================================
 bool ClientHandler::handleCommand(const std::string& text) {
     auto [cmd, args] = parseCommand(text);
 
-    if (cmd == "nick") {
-        // /nick <name>
-        if (args.empty()) {
-            sendMessage(socket_, MessageType::SYSTEM, "Usage: /nick <name>");
-        } else {
-            std::string oldNick = nickname_;
-            setNickname(args);
-            sendMessage(socket_, MessageType::SYSTEM,
-                        "Your nickname is now: " + nickname_);
-            // Broadcast thay đổi nickname
-            broadcastCallback_(socket_, MessageType::NICKNAME,
-                               oldNick + " -> " + nickname_, INVALID_SOCKET);
+    if (cmd == "users" || cmd == "list") {
+        // /users - hiển thị danh sách user online
+        if (auto bridge = bridge_.lock()) {
+            bridge->sendUserList(socket_);
         }
         return true;
     }
 
-    if (cmd == "list") {
-        // /list - hiển thị danh sách client
-        auto clients = listCallback_();
-        std::ostringstream oss;
-        oss << "=== Connected users (" << clients.size() << ") ===\n";
-        for (const auto& client : clients) {
-            std::string marker = (client.socket == socket_) ? " (you)" : "";
-            oss << "  - " << client.nickname << marker << "\n";
+    if (cmd == "join") {
+        // /join <roomName>
+        if (args.empty()) {
+            sendMessage(socket_, MessageType::SYSTEM, "Usage: /join <roomName>");
+            return true;
         }
-        sendMessage(socket_, MessageType::SYSTEM, oss.str());
+
+        std::string newRoom = trim(args);
+        if (newRoom.length() > Config::MAX_ROOM_NAME_LEN) {
+            sendMessage(socket_, MessageType::SYSTEM, "Room name too long.");
+            return true;
+        }
+
+        // Cập nhật room
+        std::string oldRoom = getRoom();
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            room_ = newRoom;
+        }
+
+        // Cập nhật trong server
+        if (auto bridge = bridge_.lock()) {
+            bridge->updateClientRoom(socket_, newRoom);
+            bridge->sendRoomJoined(socket_, newRoom);
+            bridge->broadcastRoomJoin(getNickname(), newRoom);
+        }
+
         return true;
+    }
+
+    if (cmd == "msg" || cmd == "dm" || cmd == "w") {
+        // /msg <nickname> <message>
+        // args format: "nickname message"
+        size_t spacePos = args.find(' ');
+        if (spacePos == std::string::npos) {
+            sendMessage(socket_, MessageType::SYSTEM,
+                        "Usage: /msg <nickname> <message>");
+            return true;
+        }
+
+        std::string targetNick = trim(args.substr(0, spacePos));
+        std::string privMsg    = trim(args.substr(spacePos + 1));
+
+        if (targetNick.empty() || privMsg.empty()) {
+            sendMessage(socket_, MessageType::SYSTEM,
+                        "Usage: /msg <nickname> <message>");
+            return true;
+        }
+
+        if (auto bridge = bridge_.lock()) {
+            bridge->sendPrivateMessage(socket_, getNickname(), targetNick, privMsg);
+        }
+
+        return true;
+    }
+
+    if (cmd == "quit" || cmd == "exit" || cmd == "q") {
+        // /quit - ngắt kết nối
+        sendMessage(socket_, MessageType::SYSTEM, "Goodbye!");
+        return false;
     }
 
     if (cmd == "help" || cmd == "?") {
         std::string help =
             "=== Commands ===\n"
-            "  /nick <name>  - Change your nickname\n"
-            "  /list         - List all connected users\n"
-            "  /help         - Show this help\n"
-            "  /quit         - Disconnect\n";
+            "  /users           - List online users\n"
+            "  /join <room>     - Join a room\n"
+            "  /msg <n> <msg>   - Send private message\n"
+            "  /nick <name>     - Change your nickname\n"
+            "  /quit            - Disconnect\n";
         sendMessage(socket_, MessageType::SYSTEM, help);
         return true;
     }
 
-    if (cmd == "quit" || cmd == "exit") {
-        sendMessage(socket_, MessageType::SYSTEM, "Goodbye!");
-        return false;  // Ngắt kết nối
+    if (cmd == "nick" || cmd == "rename") {
+        // /nick <newName> - đổi nickname
+        if (args.empty()) {
+            sendMessage(socket_, MessageType::SYSTEM, "Usage: /nick <newNickname>");
+            return true;
+        }
+        std::string newNick = trim(args);
+        if (newNick.length() > Config::MAX_NICKNAME_LEN) {
+            sendMessage(socket_, MessageType::SYSTEM, "Nickname too long.");
+            return true;
+        }
+        if (auto bridge = bridge_.lock()) {
+            if (bridge->nicknameExists(newNick, socket_)) {
+                sendMessage(socket_, MessageType::SYSTEM,
+                            "Nickname '" + newNick + "' is already taken.");
+                return true;
+            }
+        }
+        std::string oldNick = getNickname();
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            nickname_ = newNick;
+        }
+        // Cập nhật nickname trong server
+        if (auto bridge = bridge_.lock()) {
+            bridge->updateClientNickname(socket_, newNick);
+        }
+        sendMessage(socket_, MessageType::SYSTEM,
+                    "Nickname changed from " + oldNick + " to " + newNick);
+        return true;
     }
 
     // Lệnh không hợp lệ
-    sendMessage(socket_, MessageType::SYSTEM, "Unknown command: /" + cmd + ". Type /help for help.");
+    sendMessage(socket_, MessageType::SYSTEM,
+                "Unknown command: /" + cmd + ". Type /help for help.");
     return true;
 }
 
 // ============================================================
-// handleNormalMessage: xử lý tin nhắn thường (broadcast)
+// handleNormalMessage: xử lý tin nhắn thường (broadcast trong room)
 // ============================================================
 void ClientHandler::handleNormalMessage(const std::string& text) {
     if (text.empty()) {
         return;
     }
 
-    LOG_INFO("Broadcast from {}: {}", nickname_, text);
-
-    // Broadcast cho tất cả client khác
-    // Format: "[nickname]: message"
-    broadcastCallback_(socket_, MessageType::BROADCAST, text, socket_);
+    if (auto bridge = bridge_.lock()) {
+        bridge->broadcastToRoom(socket_, getNickname(), getRoom(), text);
+    }
 }
 
 // ============================================================
@@ -231,4 +364,33 @@ void ClientHandler::handleNormalMessage(const std::string& text) {
 // ============================================================
 bool ClientHandler::isAlive() const {
     return socket_ != INVALID_SOCKET;
+}
+
+// ============================================================
+// cleanupAndRemove: cleanup khi client disconnect
+//
+// THỨ TỰ QUAN TRỌNG:
+//   1. Đóng socket TRƯỚC
+//   2. Gọi removeClient SAU (server chỉ xóa khỏi list, không đóng socket)
+// ============================================================
+void ClientHandler::cleanupAndRemove() {
+    // NOTE: Lấy nickname TRƯỚC khi đóng socket
+    std::string nick = getNickname();
+    SOCKET deadSocket = INVALID_SOCKET;
+
+    // Bước 1: Đóng socket
+    if (socket_ != INVALID_SOCKET) {
+        deadSocket = socket_;
+        ::shutdown(socket_, SD_BOTH);
+        closesocket(socket_);
+        socket_ = INVALID_SOCKET;
+    }
+
+    // Bước 2: Xóa khỏi danh sách server
+    // NOTE: Pass deadSocket (đã invalid), server chỉ xóa khỏi list
+    if (auto bridge = bridge_.lock()) {
+        bridge->removeClient(deadSocket, nick);
+    }
+
+    running_ = false;
 }

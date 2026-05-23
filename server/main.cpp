@@ -2,10 +2,15 @@
 // server/main.cpp
 // Entry point của server
 //
-// Cách chạy:
+// Cách compile:
 //   cd server
 //   g++ main.cpp server.cpp client_handler.cpp -o server.exe -lws2_32 -std=c++17
-//   ./server.exe [port]
+//
+// Cách chạy:
+//   server.exe [port]
+//   server.exe 8080
+//
+// Features: Nickname, Rooms, Private Message, Online Users, Logging
 // ============================================================
 
 #include <iostream>
@@ -15,12 +20,16 @@
 #include <chrono>
 #include "server.h"
 
+// ============================================================
 // Flag để graceful shutdown khi nhận Ctrl+C
+// ============================================================
 static volatile std::sig_atomic_t gRunning = 1;
 
+// ============================================================
 // Signal handler cho Ctrl+C
+// ============================================================
 static void signalHandler(int signal) {
-    if (signal == SIGINT || signal == SIGTERM) {
+    if (signal == SIGINT || signal == SIGBREAK) {
         gRunning = 0;
     }
 }
@@ -42,13 +51,13 @@ void consoleCommandThread(Server* server) {
         if (line.empty()) continue;
 
         if (line == "/quit" || line == "/exit" || line == "q") {
-            LOG_INFO("Console command: shutting down");
+            std::cout << "[Console] Shutting down...\n";
             gRunning = 0;
             break;
         }
 
         if (line == "/stats") {
-            LOG_INFO("Connected clients: {}", server->getClientCount());
+            std::cout << "[Console] Connected clients: " << server->getClientCount() << "\n";
         } else if (line == "/help") {
             std::cout << "Available commands:\n"
                       << "  /stats    - Show number of connected clients\n"
@@ -64,39 +73,41 @@ void consoleCommandThread(Server* server) {
 // main
 // ============================================================
 int main(int argc, char* argv[]) {
+    std::cout << "===========================================\n"
+              << "   Mini Chat C++ Server\n"
+              << "   Nickname + Rooms + Private Message\n"
+              << "===========================================\n";
+
     // Parse port từ command line
     uint16_t port = Config::DEFAULT_PORT;
     if (argc > 1) {
         try {
             port = static_cast<uint16_t>(std::stoi(argv[1]));
         } catch (const std::exception& e) {
-            std::cerr << "Invalid port number: " << argv[1] << "\n";
+            std::cerr << "[ERROR] Invalid port number: " << argv[1] << "\n";
             return 1;
         }
     }
+
+    std::cout << "Port: " << port << "\n"
+              << "Log file: server.log\n"
+              << "Commands: /stats, /quit, /help\n"
+              << "Press Ctrl+C to stop.\n"
+              << "===========================================\n\n";
 
     // Setup signal handler cho Ctrl+C
     std::signal(SIGINT, signalHandler);
     std::signal(SIGBREAK, signalHandler);
 
-    // Banner
-    std::cout << "===========================================\n"
-              << "   Mini Chat C++ Server (Refactored)\n"
-              << "===========================================\n"
-              << "Port: " << port << "\n"
-              << "Commands: /stats, /quit, /help\n"
-              << "Press Ctrl+C to stop.\n"
-              << "===========================================\n\n";
-
     // Tạo và khởi tạo server
     Server server(port);
 
     if (!server.init()) {
-        LOG_ERROR("Failed to initialize server");
+        std::cerr << "[ERROR] Failed to initialize server\n";
         return 1;
     }
 
-    // Chạy console command thread (để nhập lệnh khi server chạy)
+    // Chạy console command thread
     std::thread consoleThread(consoleCommandThread, &server);
 
     // Chạy server (blocking)

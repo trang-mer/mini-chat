@@ -2,18 +2,13 @@
 // common/protocol.h
 // Định nghĩa protocol truyền tin giữa server và client
 //
-// Protocol: [uint32_t length (4 bytes, network byte order)][message bytes]
-// - 4 bytes đầu: độ dài message (big-endian)
-// - Tiếp theo: nội dung message (không null-terminated)
+// Protocol: [1 byte type][4 bytes length (big-endian)][payload]
 //
-// Ví dụ: gửi "Hello" (5 bytes)
-//   Byte 0-3: 0x00 0x00 0x00 0x05  (5 = 0x00000005)
-//   Byte 4-8: 'H' 'e' 'l' 'l' 'o'
-//
-// Ưu điểm so với null-terminated:
-// - Xử lý được binary data (có thể chứa '\0')
-// - Biết chính xác bao nhiêu bytes cần đọc
-// - Tránh buffer overflow
+// PHASE 4 - Thêm:
+//   - PRIVATE: tin nhắn riêng tư
+//   - ROOM_JOIN: thông báo user join room
+//   - ROOM_LEAVE: thông báo user rời room
+//   - USER_LIST: danh sách user online
 // ============================================================
 
 #ifndef PROTOCOL_H
@@ -31,40 +26,42 @@ namespace Config {
     constexpr int      RECV_BUFFER_SIZE = 8192;
     constexpr int      MAX_MESSAGE_SIZE = 4096;
     constexpr int      MAX_NICKNAME_LEN  = 32;
+    constexpr int      MAX_ROOM_NAME_LEN = 32;
+    constexpr char     DEFAULT_ROOM[]    = "general";
 }
 
 // ============================================================
 // MessageType: các loại message trong protocol
 // ============================================================
 enum class MessageType : uint8_t {
-    NORMAL       = 0,   // Tin nhắn thường (broadcast)
-    SYSTEM       = 1,   // Tin nhắn hệ thống (server -> client)
-    PRIVATE      = 2,   // Tin nhắn riêng tư (sender -> target)
-    COMMAND      = 3,   // Lệnh client -> server (/nick, /quit, /list)
-    NICKNAME     = 4,   // Thông báo đổi nickname
-    BROADCAST    = 5,   // Server broadcast có prefix "[nickname]: "
+    NORMAL     = 0,   // Tin nhắn thường (broadcast trong room)
+    SYSTEM     = 1,   // Tin nhắn hệ thống (server -> client)
+    PRIVATE    = 2,   // Tin nhắn riêng tư (sender -> target)
+    COMMAND    = 3,   // Lệnh client -> server (/users, /join, /msg, /quit)
+    ROOM_JOIN  = 4,   // Thông báo user join room
+    ROOM_LEAVE = 5,   // Thông báo user rời room
+    USER_LIST  = 6,   // Danh sách user online
 };
 
 // ============================================================
 // MessageHeader: header của mỗi message
 //   [MessageType: 1 byte][Length: 4 bytes][payload]
 // ============================================================
+#pragma pack(push, 1)
 struct MessageHeader {
     MessageType type;
     uint32_t    length;   // độ dài payload (network byte order = big-endian)
-
-    // Đóng gói struct: không có padding giữa các field
-    // Đảm bảo kích thước chính xác 5 bytes
-} __attribute__((packed));
+};
+#pragma pack(pop)
 
 static_assert(sizeof(MessageHeader) == 5, "MessageHeader must be exactly 5 bytes");
 
 // ============================================================
-// Message: cấu trúc message hoàn chỉnh (header + payload)
+// Message: cấu trúc message hoàn chỉnh
 // ============================================================
 struct Message {
     MessageType type;
-    std::string payload;   // nội dung message
+    std::string payload;
 
     Message() : type(MessageType::NORMAL) {}
     Message(MessageType t, const std::string& p) : type(t), payload(p) {}
@@ -74,7 +71,7 @@ struct Message {
 // Helper functions: pack/unpack network messages
 // ============================================================
 
-// Chuyển uint32_t từ host byte order sang network byte order (big-endian)
+// Chuyển uint32_t sang network byte order (big-endian)
 [[nodiscard]] inline uint32_t htonl_safe(uint32_t hostlong) {
     return htonl(hostlong);
 }
@@ -113,9 +110,36 @@ struct Message {
     return packMessage(MessageType::SYSTEM, text);
 }
 
-// Đóng gói tin nhắn broadcast có prefix
-[[nodiscard]] inline std::string makeBroadcastMessage(const std::string& nickname, const std::string& text) {
-    return packMessage(MessageType::BROADCAST, nickname + ": " + text);
+// Đóng gói tin nhắn broadcast trong room
+// Format hiển thị: [roomName] nickname: message
+[[nodiscard]] inline std::string makeRoomBroadcast(const std::string& room,
+                                                   const std::string& nickname,
+                                                   const std::string& text) {
+    return packMessage(MessageType::NORMAL, "[" + room + "] " + nickname + ": " + text);
+}
+
+// Đóng gói tin nhắn riêng tư
+// Format hiển thị: [Private] senderNickname: message
+[[nodiscard]] inline std::string makePrivateMessage(const std::string& senderNickname,
+                                                     const std::string& text) {
+    return packMessage(MessageType::PRIVATE, "[Private] " + senderNickname + ": " + text);
+}
+
+// Đóng gói thông báo join room
+[[nodiscard]] inline std::string makeRoomJoinMessage(const std::string& nickname,
+                                                      const std::string& room) {
+    return packMessage(MessageType::ROOM_JOIN, nickname + " joined room: " + room);
+}
+
+// Đóng gói thông báo leave room
+[[nodiscard]] inline std::string makeRoomLeaveMessage(const std::string& nickname,
+                                                       const std::string& room) {
+    return packMessage(MessageType::ROOM_LEAVE, nickname + " left room: " + room);
+}
+
+// Đóng gói danh sách user online
+[[nodiscard]] inline std::string makeUserListMessage(const std::string& listText) {
+    return packMessage(MessageType::USER_LIST, listText);
 }
 
 #endif // PROTOCOL_H

@@ -2,14 +2,12 @@
 // client/client.h
 // TCP Client cho mini-chat-cpp
 //
-// Kiến trúc 2 thread:
-//   - Main thread: nhận input từ console, gửi message
-//   - Receive thread: nhận message từ server, hiển thị
-//
-// Đồng bộ:
-//   - Receive thread gửi message -> main thread hiển thị
-//   - Dùng mutex + condition variable để thread-safe
-//   - Main thread kiểm tra running flag thường xuyên
+// Features:
+//   - 2 threads: receive thread (nhận từ server) + main thread (gửi/nhập)
+//   - Hỗ trợ /users, /join, /msg, /quit
+//   - Hiển thị tin nhắn theo format: [room] nickname: message
+//   - Private message format: [Private] nickname: message
+//   - Setup phase: nhập nickname trước khi chat
 // ============================================================
 
 #ifndef CLIENT_H
@@ -20,10 +18,11 @@
 #include <ws2tcpip.h>
 #include <atomic>
 #include <mutex>
-#include <condition_variable>
 #include <string>
 #include <queue>
 #include <thread>
+#include <condition_variable>
+#include <functional>
 #include "../common/protocol.h"
 #include "../common/logger.h"
 #include "../common/utils.h"
@@ -31,61 +30,66 @@
 class ChatClient {
 public:
     // Constructor
-    //   serverIP : địa chỉ IP của server (mặc định: 127.0.0.1)
-    //   port     : cổng của server (mặc định: 8080)
     ChatClient(const std::string& serverIP = "127.0.0.1",
                uint16_t port = Config::DEFAULT_PORT);
 
-    // Destructor: tự động cleanup
     ~ChatClient();
 
-    // Không cho copy
     ChatClient(const ChatClient&)            = delete;
     ChatClient& operator=(const ChatClient&) = delete;
 
     // Kết nối tới server
-    // Trả về: true nếu thành công
-    [[nodiscard]] bool connect(const std::string& nickname = "");
+    [[nodiscard]] bool connect();
 
     // Chạy client (blocking - main loop)
-    // Cho phép nhập message từ console và gửi đi
     void run();
 
-    // Ngắt kết nối (gọi từ thread khác)
+    // Ngắt kết nối
     void disconnect();
 
-    // Kiểm tra còn kết nối không
     [[nodiscard]] bool isConnected() const { return connected_.load(); }
 
     // Getters
-    [[nodiscard]] std::string getNickname() const { return nickname_; }
+    [[nodiscard]] std::string getServerIP()   const { return serverIP_; }
+    [[nodiscard]] uint16_t    getServerPort() const { return serverPort_; }
+
+    // Gửi message tới server (public để main.cpp gửi nickname)
+    bool sendToServer(MessageType type, const std::string& text);
+
+    // Đọc 1 message từ queue (blocking, dùng cho setup phase)
+    bool waitForMessage(std::string& outMsg, int timeoutMs = 5000);
+
+    // Kiểm tra queue có message không (non-blocking)
+    bool hasMessage();
+
+    // Lấy 1 message từ queue (non-blocking)
+    bool popMessage(std::string& outMsg);
+
+    // Đăng ký callback được gọi khi có message mới
+    void setMessageCallback(std::function<void(const std::string&)> cb);
 
 private:
     // Thread nhận message từ server
     void receiveThreadFunc();
 
-    // Gửi message tới server
-    // Trả về: true nếu gửi thành công
-    bool sendToServer(MessageType type, const std::string& text);
-
     // Xử lý một message nhận được
     void handleIncomingMessage(const Message& msg);
 
-    // In message ra console (thread-safe)
-    void printMessage(const std::string& text);
+    std::string        serverIP_;
+    uint16_t          serverPort_;
+    SOCKET            serverSocket_;
+    std::atomic<bool> connected_;
+    std::atomic<bool> running_;
 
     // Queue để truyền message từ receive thread -> main thread
     std::queue<std::string>  messageQueue_;
     mutable std::mutex       messageQueueMutex_;
     std::condition_variable  messageQueueCV_;
 
-    std::string        serverIP_;       // IP của server
-    uint16_t          serverPort_;     // Port của server
-    SOCKET            serverSocket_;    // Socket kết nối
-    std::string       nickname_;       // Nickname của user
-    std::atomic<bool> connected_;      // Còn kết nối không
-    std::atomic<bool> running_;        // Client đang chạy không
-    std::thread       receiveThread_;  // Thread nhận message
+    // Callback khi có message mới
+    std::function<void(const std::string&)> messageCallback_;
+
+    std::thread       receiveThread_;
 };
 
 #endif // CLIENT_H

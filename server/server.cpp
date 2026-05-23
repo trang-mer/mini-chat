@@ -1,10 +1,11 @@
 // ============================================================
 // server/server.cpp
 // Implementation của Server
+//
+// Features: nickname, rooms, private message, logging
 // ============================================================
 
 #include "server.h"
-#include <thread>
 
 // ============================================================
 // Constructor
@@ -14,11 +15,10 @@ Server::Server(uint16_t port)
     , serverSocket_(INVALID_SOCKET)
     , running_(false)
 {
-    LOG_INFO("Server instance created (port: {})", port_);
 }
 
 // ============================================================
-// Destructor: graceful shutdown
+// Destructor
 // ============================================================
 Server::~Server() {
     if (running_.load()) {
@@ -34,19 +34,19 @@ bool Server::init() {
     WSADATA wsaData;
     int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (result != 0) {
-        LOG_ERROR("WSAStartup failed: error code {}", result);
+        std::cerr << "[ERROR] WSAStartup failed: error code " << result << "\n";
         return false;
     }
-    LOG_INFO("Winsock initialized (version 2.2)");
+    std::cout << "[OK] Winsock initialized (version 2.2)\n";
 
     // 2. Tạo server socket
     serverSocket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (serverSocket_ == INVALID_SOCKET) {
-        LOG_ERROR("socket() failed: {}", wsaErrorString(WSAGetLastError()));
+        std::cerr << "[ERROR] socket() failed: " << wsaErrorString(WSAGetLastError()) << "\n";
         WSACleanup();
         return false;
     }
-    LOG_INFO("Server socket created");
+    std::cout << "[OK] Server socket created\n";
 
     // 3. Cho phép reuse address (tránh lỗi "Address already in use" khi restart)
     int reuseAddr = 1;
@@ -61,22 +61,30 @@ bool Server::init() {
 
     result = bind(serverSocket_, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
     if (result == SOCKET_ERROR) {
-        LOG_ERROR("bind() failed: {}", wsaErrorString(WSAGetLastError()));
+        std::cerr << "[ERROR] bind() failed: " << wsaErrorString(WSAGetLastError()) << "\n";
         closesocket(serverSocket_);
         WSACleanup();
         return false;
     }
-    LOG_INFO("Socket bound to port {}", port_);
+    std::cout << "[OK] Socket bound to port " << port_ << "\n";
 
     // 5. Bắt đầu lắng nghe
     result = listen(serverSocket_, SOMAXCONN);
     if (result == SOCKET_ERROR) {
-        LOG_ERROR("listen() failed: {}", wsaErrorString(WSAGetLastError()));
+        std::cerr << "[ERROR] listen() failed: " << wsaErrorString(WSAGetLastError()) << "\n";
         closesocket(serverSocket_);
         WSACleanup();
         return false;
     }
-    LOG_INFO("Server listening on port {}...", port_);
+
+    // 6. Mở file log
+    logFile_.open("server.log", std::ios::out | std::ios::trunc);
+    if (!logFile_.is_open()) {
+        std::cerr << "[WARNING] Cannot open server.log for writing\n";
+    }
+
+    // 7. Log server started
+    logToFile("[INFO]", "Server started on port " + std::to_string(port_));
 
     running_ = true;
     return true;
@@ -87,11 +95,12 @@ bool Server::init() {
 // ============================================================
 void Server::run() {
     if (!running_.load()) {
-        LOG_ERROR("Server not initialized. Call init() first.");
+        std::cerr << "[ERROR] Server not initialized. Call init() first.\n";
         return;
     }
 
-    LOG_INFO("Server is running. Press Ctrl+C to stop.");
+    std::cout << "[OK] Server listening on port " << port_ << "...\n";
+    std::cout << "[INFO] Press Ctrl+C to stop.\n\n";
 
     while (running_.load()) {
         // Sử dụng select() để non-blocking accept
@@ -105,7 +114,9 @@ void Server::run() {
 
         int ready = select(0, &readSet, nullptr, nullptr, &timeout);
         if (ready == SOCKET_ERROR) {
-            LOG_ERROR("select() failed: {}", wsaErrorString(WSAGetLastError()));
+            if (running_.load()) {
+                std::cerr << "[ERROR] select() failed: " << wsaErrorString(WSAGetLastError()) << "\n";
+            }
             break;
         }
         if (ready == 0) {
@@ -117,7 +128,7 @@ void Server::run() {
         acceptClient();
     }
 
-    LOG_INFO("Server run loop ended.");
+    logToFile("[INFO]", "Server run loop ended");
 }
 
 // ============================================================
@@ -128,7 +139,8 @@ void Server::shutdown() {
         return;
     }
 
-    LOG_INFO("Shutting down server...");
+    std::cout << "\n[INFO] Shutting down server...\n";
+    logToFile("[INFO]", "Server shutting down");
 
     running_ = false;
 
@@ -139,19 +151,21 @@ void Server::shutdown() {
         serverSocket_ = INVALID_SOCKET;
     }
 
-    // Xóa tất cả client
+    // Xóa tất cả client (chỉ xóa khỏi list, KHÔNG đóng socket)
+    // ClientHandler đã tự đóng socket khi nhận shutdown notification
     {
         std::lock_guard<std::mutex> lock(clientsMutex_);
-        for (auto& [socket, info] : clients_) {
-            if (socket != INVALID_SOCKET) {
-                closesocket(socket);
-            }
-        }
         clients_.clear();
     }
 
+    // Đóng file log
+    if (logFile_.is_open()) {
+        logFile_.close();
+    }
+
     WSACleanup();
-    LOG_INFO("Server shutdown complete.");
+    std::cout << "[INFO] Server shutdown complete.\n";
+    logToFile("[INFO]", "Server shutdown complete");
 }
 
 // ============================================================
@@ -169,7 +183,7 @@ void Server::acceptClient() {
 
     if (clientSocket == INVALID_SOCKET) {
         if (running_.load()) {
-            LOG_ERROR("accept() failed: {}", wsaErrorString(WSAGetLastError()));
+            std::cerr << "[ERROR] accept() failed: " << wsaErrorString(WSAGetLastError()) << "\n";
         }
         return;
     }
@@ -179,123 +193,255 @@ void Server::acceptClient() {
     inet_ntop(AF_INET, &clientAddr.sin_addr, ipBuf, sizeof(ipBuf));
     uint16_t port = ntohs(clientAddr.sin_port);
 
-    LOG_INFO("New connection from {}:{}", ipBuf, port);
+    std::cout << "[INFO] New connection from " << ipBuf << ":" << port << "\n";
+    logToFile("[INFO]", std::string("New connection from ") + ipBuf + ":" + std::to_string(port));
 
-    // Tạo ClientInfo
+    // Tạo ClientInfo (chưa có nickname, sẽ đợi client nhập)
     ClientInfo info;
-    info.socket     = clientSocket;
-    info.ipAddress  = ipBuf;
+    info.socket      = clientSocket;
+    info.ipAddress   = ipBuf;
     info.port        = port;
     info.connectTime = time(nullptr);
-    info.nickname    = std::string(ipBuf) + ":" + std::to_string(port);
+    info.nickname    = "";        // Chưa có nickname
+    info.room        = Config::DEFAULT_ROOM;
 
     // Thêm vào danh sách (mutex)
     {
         std::lock_guard<std::mutex> lock(clientsMutex_);
-        clients_[clientSocket] = info;
+        clients_.push_back(info);
     }
 
-    // Tạo callbacks cho ClientHandler
-    auto broadcastCb = [this](SOCKET sender, MessageType type,
-                               const std::string& text, SOCKET exclude) {
-        broadcastToClients(sender, type, text, exclude);
-    };
+    // Tạo shared_ptr tới Server (dùng this, Server tồn tại đến khi main kết thúc)
+    std::shared_ptr<Server> serverPtr(this, [](Server*){});  // no-op deleter
 
-    auto unregisterCb = [this](SOCKET socket) {
-        unregisterClient(socket);
-    };
-
-    auto listCb = [this]() -> std::vector<ClientInfo> {
-        return getClientList();
-    };
-
-    // Tạo ClientHandler trong shared_ptr để quản lý vòng đời
-    auto handler = std::make_shared<ClientHandler>(
-        clientSocket, broadcastCb, unregisterCb, listCb
-    );
+    // Tạo ClientHandler trong shared_ptr
+    auto handler = std::make_shared<ClientHandler>(clientSocket, serverPtr);
 
     // Tạo thread để chạy handler
-    // Lưu thread trong map để quản lý (thay vì detach)
-    // Thread chạy handler->start() và tự cleanup khi kết thúc
+    // Handler chạy trong thread riêng, tự cleanup khi kết thúc
     std::thread([handler]() {
         handler->start();
     }).detach();
 
-    LOG_INFO("Client {} connected. Total clients: {}",
-             info.nickname, clients_.size());
+    std::cout << "[INFO] Client thread started. Waiting for nickname...\n";
 }
 
 // ============================================================
-// broadcastToClients: gửi message cho tất cả client
-//
-// Thread safety:
-//   1. Lock mutex -> copy danh sách sockets -> unlock
-//   2. Gửi message cho từng socket (không mutex)
-//   3. Nếu gửi thất bại -> unregister
-//
-// Lý do copy trước:
-//   - Tránh giữ mutex quá lâu (chỉ giữ khi copy)
-//   - Gửi message có thể lâu, không nên giữ mutex
-//   - Nếu unregister xảy ra trong lúc gửi, không ảnh hưởng
-//     (chúng ta chỉ gửi đến socket cũ, không lỗi)
+// broadcastToRoom: gửi message cho tất cả client trong cùng room
 // ============================================================
-void Server::broadcastToClients(SOCKET sender, MessageType type,
-                               const std::string& text, SOCKET exclude) {
-    (void)sender;  // reserved for future use (e.g., logging sender info)
-    // Copy danh sách sockets dưới mutex
+void Server::broadcastToRoom(SOCKET senderSocket,
+                            const std::string& senderNickname,
+                            const std::string& senderRoom,
+                            const std::string& message) {
+    // Copy danh sách sockets trong cùng room
     std::vector<SOCKET> targetSockets;
 
     {
         std::lock_guard<std::mutex> lock(clientsMutex_);
-        for (const auto& [socket, info] : clients_) {
-            if (socket != INVALID_SOCKET && socket != exclude) {
-                targetSockets.push_back(socket);
+        for (const auto& client : clients_) {
+            if (client.socket != INVALID_SOCKET
+                && client.socket != senderSocket
+                && client.room == senderRoom) {
+                targetSockets.push_back(client.socket);
             }
         }
     }
-    // Mutex đã unlock ở đây -> có thể gửi message
+    // Mutex đã unlock -> gửi message
 
-    // Gửi cho từng client (không mutex)
+    // Log chat message
+    logToFile("[CHAT]", "[" + senderRoom + "] " + senderNickname + ": " + message);
+
+    // Gửi cho từng client
     for (SOCKET targetSocket : targetSockets) {
-        bool success = sendMessage(targetSocket, type, text);
+        std::string fullMessage = "[" + senderRoom + "] " + senderNickname + ": " + message;
+        bool success = sendMessage(targetSocket, MessageType::NORMAL, fullMessage);
         if (!success) {
-            LOG_WARNING("Failed to send to client, removing...");
-            unregisterClient(targetSocket);
+            // Gửi thất bại -> tìm nickname để log rồi remove
+            std::string nick = "(unknown)";
+            {
+                std::lock_guard<std::mutex> lock(clientsMutex_);
+                for (const auto& c : clients_) {
+                    if (c.socket == targetSocket) {
+                        nick = c.nickname;
+                        break;
+                    }
+                }
+            }
+            std::cout << "[WARNING] Failed to send to client " << nick << ", removing...\n";
+            removeClient(targetSocket, nick);
         }
     }
 }
 
 // ============================================================
-// unregisterClient: xóa client khỏi danh sách
+// sendPrivateMessage: gửi tin nhắn riêng từ sender tới target
 // ============================================================
-void Server::unregisterClient(SOCKET socket) {
-    std::string nickname;
+void Server::sendPrivateMessage(SOCKET senderSocket,
+                                const std::string& senderNickname,
+                                const std::string& targetNickname,
+                                const std::string& message) {
+    SOCKET targetSocket = INVALID_SOCKET;
+
+    // Tìm socket của target nickname
+    {
+        std::lock_guard<std::mutex> lock(clientsMutex_);
+        for (const auto& client : clients_) {
+            if (client.nickname == targetNickname && client.socket != senderSocket) {
+                targetSocket = client.socket;
+                break;
+            }
+        }
+    }
+
+    if (targetSocket == INVALID_SOCKET) {
+        // Không tìm thấy user -> gửi thông báo cho sender
+        sendMessage(senderSocket, MessageType::SYSTEM, "User not found.");
+        return;
+    }
+
+    // Gửi tin nhắn riêng cho target
+    std::string fullMessage = "[Private] " + senderNickname + ": " + message;
+    bool success = sendMessage(targetSocket, MessageType::PRIVATE, fullMessage);
+
+    if (success) {
+        logToFile("[PRIVATE]", senderNickname + " -> " + targetNickname + ": " + message);
+    } else {
+        // Target đã disconnect -> remove
+        removeClient(targetSocket, targetNickname);
+    }
+}
+
+// ============================================================
+// sendUserList: gửi danh sách user online tới một client
+// ============================================================
+void Server::sendUserList(SOCKET clientSocket) {
+    std::ostringstream oss;
 
     {
         std::lock_guard<std::mutex> lock(clientsMutex_);
-        auto it = clients_.find(socket);
-        if (it != clients_.end()) {
-            nickname = it->second.nickname;
-            clients_.erase(it);
+        size_t count = clients_.size();
+        oss << "Online users (" << count << "):\n";
+        for (const auto& client : clients_) {
+            if (!client.nickname.empty()) {
+                oss << "- " << client.nickname << " in room " << client.room << "\n";
+            }
         }
     }
 
-    if (!nickname.empty()) {
-        closesocket(socket);
-        LOG_INFO("Client {} disconnected. Total clients: {}",
-                 nickname, clients_.size());
+    sendMessage(clientSocket, MessageType::USER_LIST, oss.str());
+}
+
+// ============================================================
+// sendRoomJoined: gửi thông báo cho client khi join room thành công
+// ============================================================
+void Server::sendRoomJoined(SOCKET clientSocket, const std::string& roomName) {
+    std::string msg = "You joined room: " + roomName;
+    sendMessage(clientSocket, MessageType::SYSTEM, msg);
+}
+
+// ============================================================
+// removeClient: xóa client khỏi danh sách
+// NOTE: Chỉ xóa khỏi list, KHÔNG đóng socket
+// Socket đã được ClientHandler đóng trước khi gọi hàm này
+// ============================================================
+void Server::removeClient(SOCKET socket, const std::string& nickname) {
+    bool found = false;
+    std::string nick = nickname;
+
+    {
+        std::lock_guard<std::mutex> lock(clientsMutex_);
+        for (auto it = clients_.begin(); it != clients_.end(); ++it) {
+            if (it->socket == socket) {
+                nick = it->nickname;
+                clients_.erase(it);
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if (found) {
+        if (!nick.empty()) {
+            std::cout << "[INFO] " << nick << " disconnected\n";
+            logToFile("[INFO]", nick + " disconnected");
+        } else {
+            std::cout << "[INFO] Client disconnected\n";
+            logToFile("[INFO]", "Client disconnected");
+        }
     }
 }
 
 // ============================================================
-// getClientList: lấy danh sách client (cho /list)
+// broadcastRoomJoin: broadcast thông báo user joined room
 // ============================================================
-std::vector<ClientInfo> Server::getClientList() const {
+void Server::broadcastRoomJoin(const std::string& nickname, const std::string& room) {
+    std::vector<SOCKET> targetSockets;
+
+    {
+        std::lock_guard<std::mutex> lock(clientsMutex_);
+        for (const auto& client : clients_) {
+            if (client.socket != INVALID_SOCKET && client.room == room) {
+                targetSockets.push_back(client.socket);
+            }
+        }
+    }
+
+    for (SOCKET targetSocket : targetSockets) {
+        std::string msg = nickname + " joined room " + room;
+        sendMessage(targetSocket, MessageType::SYSTEM, msg);
+    }
+
+    logToFile("[INFO]", nickname + " joined room " + room);
+}
+
+// ============================================================
+// updateClientRoom: cập nhật room của client trong danh sách
+// ============================================================
+void Server::updateClientRoom(SOCKET socket, const std::string& newRoom) {
+    std::lock_guard<std::mutex> lock(clientsMutex_);
+    for (auto& client : clients_) {
+        if (client.socket == socket) {
+            client.room = newRoom;
+            break;
+        }
+    }
+}
+
+// ============================================================
+// updateClientNickname: cập nhật nickname của client trong danh sách
+// ============================================================
+void Server::updateClientNickname(SOCKET socket, const std::string& newNickname) {
+    std::lock_guard<std::mutex> lock(clientsMutex_);
+    for (auto& client : clients_) {
+        if (client.socket == socket) {
+            client.nickname = newNickname;
+            break;
+        }
+    }
+}
+
+// ============================================================
+// nicknameExists: kiểm tra nickname đã tồn tại chưa
+// ============================================================
+bool Server::nicknameExists(const std::string& nickname, SOCKET excludeSocket) const {
+    std::lock_guard<std::mutex> lock(clientsMutex_);
+    for (const auto& client : clients_) {
+        if (client.nickname == nickname && client.socket != excludeSocket
+            && !client.nickname.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================
+// getClientList_: lấy danh sách client (dùng nội bộ)
+// ============================================================
+std::vector<ClientInfo> Server::getClientList_() const {
     std::vector<ClientInfo> result;
     std::lock_guard<std::mutex> lock(clientsMutex_);
-    result.reserve(clients_.size());
-    for (const auto& [socket, info] : clients_) {
-        result.push_back(info);
+    for (const auto& client : clients_) {
+        result.push_back(client);
     }
     return result;
 }
@@ -306,4 +452,28 @@ std::vector<ClientInfo> Server::getClientList() const {
 size_t Server::getClientCount() const {
     std::lock_guard<std::mutex> lock(clientsMutex_);
     return clients_.size();
+}
+
+// ============================================================
+// logToFile: ghi log ra console và file server.log
+// Thread-safe (dùng logMutex_)
+// ============================================================
+void Server::logToFile(const std::string& prefix, const std::string& message) {
+    // Lấy thời gian hiện tại
+    auto now  = std::chrono::system_clock::now();
+    auto time = std::chrono::system_clock::to_time_t(now);
+    char timeBuf[32];
+    std::strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", std::localtime(&time));
+
+    std::string logLine = std::string(timeBuf) + " " + prefix + " " + message;
+
+    // In ra console
+    std::cout << logLine << "\n";
+
+    // Ghi ra file (thread-safe)
+    std::lock_guard<std::mutex> lock(logMutex_);
+    if (logFile_.is_open()) {
+        logFile_ << logLine << "\n";
+        logFile_.flush();
+    }
 }

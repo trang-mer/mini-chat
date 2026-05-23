@@ -1,6 +1,11 @@
 // ============================================================
 // client/client.cpp
 // Implementation của ChatClient
+//
+// Features:
+//   - receive thread nhận message liên tục, cho vào queue
+//   - main thread nhập message và gửi lên server
+//   - Hỗ trợ /users, /join, /msg, /quit, /nick
 // ============================================================
 
 #include "client.h"
@@ -12,11 +17,9 @@ ChatClient::ChatClient(const std::string& serverIP, uint16_t port)
     : serverIP_(serverIP)
     , serverPort_(port)
     , serverSocket_(INVALID_SOCKET)
-    , nickname_("Guest")
     , connected_(false)
     , running_(false)
 {
-    LOG_INFO("ChatClient instance created");
 }
 
 // ============================================================
@@ -29,32 +32,29 @@ ChatClient::~ChatClient() {
 // ============================================================
 // connect: kết nối tới server
 // ============================================================
-bool ChatClient::connect(const std::string& nickname) {
+bool ChatClient::connect() {
     if (connected_.load()) {
-        LOG_WARNING("Already connected to server");
         return true;
     }
 
-    // 1. Khởi tạo Winsock (nếu chưa)
+    // 1. Khởi tạo Winsock (static để tránh init nhiều lần)
     WSADATA wsaData;
     static bool wsaInitialized = false;
     if (!wsaInitialized) {
         int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
         if (result != 0) {
-            LOG_ERROR("WSAStartup failed: error code {}", result);
+            std::cerr << "[ERROR] WSAStartup failed: error code " << result << "\n";
             return false;
         }
         wsaInitialized = true;
-        LOG_INFO("Winsock initialized");
     }
 
     // 2. Tạo socket
     serverSocket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (serverSocket_ == INVALID_SOCKET) {
-        LOG_ERROR("socket() failed: {}", wsaErrorString(WSAGetLastError()));
+        std::cerr << "[ERROR] socket() failed: " << wsaErrorString(WSAGetLastError()) << "\n";
         return false;
     }
-    LOG_INFO("Socket created");
 
     // 3. Kết nối tới server
     struct sockaddr_in serverAddr;
@@ -65,19 +65,13 @@ bool ChatClient::connect(const std::string& nickname) {
     int result = ::connect(serverSocket_, (struct sockaddr*)&serverAddr,
                         sizeof(serverAddr));
     if (result == SOCKET_ERROR) {
-        LOG_ERROR("connect() failed: {}", wsaErrorString(WSAGetLastError()));
+        std::cerr << "[ERROR] connect() failed: " << wsaErrorString(WSAGetLastError()) << "\n";
         closesocket(serverSocket_);
         serverSocket_ = INVALID_SOCKET;
         return false;
     }
-    LOG_INFO("Connected to {}:{}", serverIP_, serverPort_);
 
-    // 4. Đặt nickname
-    if (!nickname.empty()) {
-        nickname_ = nickname;
-    }
-
-    // 5. Bắt đầu receive thread
+    // 4. Bắt đầu receive thread
     connected_ = true;
     running_   = true;
     receiveThread_ = std::thread(&ChatClient::receiveThreadFunc, this);
@@ -93,24 +87,18 @@ void ChatClient::disconnect() {
         return;
     }
 
-    LOG_INFO("Disconnecting from server...");
-
     running_   = false;
     connected_ = false;
 
-    // Đóng socket để unblock recv()
     if (serverSocket_ != INVALID_SOCKET) {
         shutdown(serverSocket_, SD_BOTH);
         closesocket(serverSocket_);
         serverSocket_ = INVALID_SOCKET;
     }
 
-    // Đợi receive thread kết thúc
     if (receiveThread_.joinable()) {
         receiveThread_.join();
     }
-
-    LOG_INFO("Disconnected from server");
 }
 
 // ============================================================
@@ -118,55 +106,48 @@ void ChatClient::disconnect() {
 // ============================================================
 void ChatClient::run() {
     if (!connected_.load()) {
-        LOG_ERROR("Not connected to server. Call connect() first.");
+        std::cerr << "[ERROR] Not connected to server. Call connect() first.\n";
         return;
     }
 
-    LOG_INFO("Chat client running. Type /help for commands.");
-
     while (running_.load() && connected_.load()) {
-        // Hiển thị prompt
-        std::cout << "[" << nickname_ << "]> " << std::flush;
-
-        // Non-blocking check cho message queue
+        // Hiển thị message từ queue trước
         {
-            std::lock_guard<std::mutex> lock(messageQueueMutex_);
-            while (!messageQueue_.empty()) {
-                std::string msg = messageQueue_.front();
-                messageQueue_.pop();
+            std::string msg;
+            while (popMessage(msg)) {
                 std::cout << msg << "\n";
-                std::cout << "[" << nickname_ << "]> " << std::flush;
             }
         }
 
-        // Sử dụng select() để non-blocking stdin
+        // Hiển thị prompt
+        std::cout << "> " << std::flush;
+
+        // Đọc input từ user (blocking với timeout ngắn)
+        std::string line;
+        bool hasInput = false;
+
+        // Non-blocking check với select() cho stdin
         fd_set readSet;
         FD_ZERO(&readSet);
-        FD_SET(STDIN_FILENO, &readSet);  // stdin = file descriptor 0
+        FD_SET(STDIN_FILENO, &readSet);
 
         struct timeval timeout;
         timeout.tv_sec  = 0;
         timeout.tv_usec = 100000;  // 100ms
 
         int ready = select(0, &readSet, nullptr, nullptr, &timeout);
-        if (ready == SOCKET_ERROR) {
-            LOG_ERROR("select() on stdin failed");
-            break;
+        if (ready > 0) {
+            if (std::getline(std::cin, line)) {
+                hasInput = true;
+            }
         }
-        if (ready == 0) {
-            // Timeout -> kiểm tra message queue và tiếp tục
+
+        // Nếu không có input, kiểm tra xem có message nào không
+        if (!hasInput) {
+            // Tiếp tục vòng lặp để hiển thị message
             continue;
         }
 
-        // Có input từ user
-        std::string line;
-        if (!std::getline(std::cin, line)) {
-            // EOF hoặc lỗi
-            LOG_INFO("EOF received, disconnecting...");
-            break;
-        }
-
-        // Xử lý input rỗng
         line = trim(line);
         if (line.empty()) {
             continue;
@@ -176,37 +157,57 @@ void ChatClient::run() {
         if (isCommand(line)) {
             auto [cmd, args] = parseCommand(line);
 
-            if (cmd == "quit" || cmd == "exit") {
-                LOG_INFO("User requested quit");
+            if (cmd == "quit" || cmd == "exit" || cmd == "q") {
                 sendToServer(MessageType::COMMAND, "/quit");
                 break;
             }
 
-            if (cmd == "nick") {
+            if (cmd == "users" || cmd == "list") {
+                sendToServer(MessageType::COMMAND, "/users");
+                continue;
+            }
+
+            if (cmd == "join") {
                 if (args.empty()) {
-                    printMessage("Usage: /nick <new_nickname>");
+                    std::cout << "[SYSTEM] Usage: /join <roomName>\n";
                 } else {
-                    nickname_ = args;
-                    printMessage("Nickname changed to: " + nickname_);
+                    sendToServer(MessageType::COMMAND, "/join " + args);
                 }
-                continue;  // Command không cần gửi đi
+                continue;
+            }
+
+            if (cmd == "msg" || cmd == "dm" || cmd == "w") {
+                if (args.empty()) {
+                    std::cout << "[SYSTEM] Usage: /msg <nickname> <message>\n";
+                } else {
+                    sendToServer(MessageType::COMMAND, "/msg " + args);
+                }
+                continue;
+            }
+
+            if (cmd == "nick" || cmd == "rename") {
+                if (args.empty()) {
+                    std::cout << "[SYSTEM] Usage: /nick <newNickname>\n";
+                } else {
+                    sendToServer(MessageType::COMMAND, "/nick " + args);
+                }
+                continue;
             }
 
             if (cmd == "help" || cmd == "?") {
-                printMessage("Commands: /nick <name>, /list, /quit, /help");
+                std::cout << "Commands:\n"
+                          << "  /users           - List online users\n"
+                          << "  /join <room>    - Join a room\n"
+                          << "  /msg <n> <msg> - Send private message\n"
+                          << "  /nick <name>   - Change your nickname\n"
+                          << "  /quit           - Disconnect\n";
                 continue;
             }
 
-            if (cmd == "list") {
-                // Gửi command tới server
-                sendToServer(MessageType::COMMAND, line);
-                continue;
-            }
-
-            // Các command khác: gửi cho server xử lý
+            // Các command khác -> gửi cho server xử lý
             sendToServer(MessageType::COMMAND, line);
         } else {
-            // Tin nhắn thường: gửi tới server
+            // Tin nhắn thường -> broadcast trong room
             sendToServer(MessageType::NORMAL, line);
         }
     }
@@ -216,15 +217,9 @@ void ChatClient::run() {
 
 // ============================================================
 // receiveThreadFunc: thread nhận message từ server
-//
-// Chạy trong receiveThread_ riêng
-// Nhận message từ server, cho vào queue để main thread hiển thị
 // ============================================================
 void ChatClient::receiveThreadFunc() {
-    LOG_INFO("Receive thread started");
-
     while (running_.load() && connected_.load()) {
-        // Non-blocking recv với select()
         fd_set readSet;
         FD_ZERO(&readSet);
         FD_SET(serverSocket_, &readSet);
@@ -235,36 +230,30 @@ void ChatClient::receiveThreadFunc() {
 
         int ready = select(0, &readSet, nullptr, nullptr, &timeout);
         if (ready == SOCKET_ERROR) {
-            if (running_.load()) {
-                LOG_ERROR("select() failed in receive thread: {}",
-                         wsaErrorString(WSAGetLastError()));
-            }
             break;
         }
         if (ready == 0) {
-            // Timeout -> tiếp tục vòng lặp
             continue;
         }
 
-        // Nhận message
         Message msg = receiveMessage(serverSocket_);
         if (msg.payload.empty() && msg.type == MessageType::NORMAL) {
-            // Disconnect hoặc lỗi
-            LOG_INFO("Server disconnected");
+            // Disconnect
             break;
         }
 
-        // Xử lý message
         handleIncomingMessage(msg);
     }
 
     connected_ = false;
     running_   = false;
 
-    // Thông báo cho main thread
-    printMessage("\n*** Disconnected from server ***\n");
-
-    LOG_INFO("Receive thread ended");
+    // Thông báo disconnect
+    {
+        std::lock_guard<std::mutex> lock(messageQueueMutex_);
+        messageQueue_.push("\n*** Disconnected from server ***\n");
+    }
+    messageQueueCV_.notify_one();
 }
 
 // ============================================================
@@ -277,7 +266,6 @@ bool ChatClient::sendToServer(MessageType type, const std::string& text) {
 
     bool success = sendMessage(serverSocket_, type, text);
     if (!success) {
-        LOG_ERROR("sendMessage failed");
         connected_ = false;
     }
 
@@ -292,37 +280,79 @@ void ChatClient::handleIncomingMessage(const Message& msg) {
 
     switch (msg.type) {
         case MessageType::SYSTEM:
-            output = "[SYSTEM] " + msg.payload;
-            break;
-
-        case MessageType::BROADCAST:
-            output = msg.payload;
-            break;
-
         case MessageType::NORMAL:
+        case MessageType::PRIVATE:
+        case MessageType::ROOM_JOIN:
+        case MessageType::ROOM_LEAVE:
             output = msg.payload;
             break;
 
-        case MessageType::NICKNAME:
-            output = "[NICK] " + msg.payload;
+        case MessageType::USER_LIST:
+            output = "\n" + msg.payload + "\n";
             break;
 
         default:
-            output = "[?] " + msg.payload;
+            output = msg.payload;
             break;
     }
 
-    // Cho vào queue để main thread hiển thị (thread-safe)
+    // Cho vào queue để main thread hiển thị
     {
         std::lock_guard<std::mutex> lock(messageQueueMutex_);
         messageQueue_.push(output);
     }
+    messageQueueCV_.notify_one();
+
+    // Gọi callback nếu có
+    if (messageCallback_) {
+        messageCallback_(output);
+    }
 }
 
 // ============================================================
-// printMessage: in message ra console (thread-safe)
+// waitForMessage: đợi message trong queue (blocking)
 // ============================================================
-void ChatClient::printMessage(const std::string& text) {
+bool ChatClient::waitForMessage(std::string& outMsg, int timeoutMs) {
+    std::unique_lock<std::mutex> lock(messageQueueMutex_);
+
+    bool ok = messageQueueCV_.wait_for(
+        lock,
+        std::chrono::milliseconds(timeoutMs),
+        [this] { return !messageQueue_.empty() || !running_.load(); }
+    );
+
+    if (ok && !messageQueue_.empty()) {
+        outMsg = messageQueue_.front();
+        messageQueue_.pop();
+        return true;
+    }
+    return false;
+}
+
+// ============================================================
+// hasMessage: kiểm tra queue có message không (non-blocking)
+// ============================================================
+bool ChatClient::hasMessage() {
     std::lock_guard<std::mutex> lock(messageQueueMutex_);
-    messageQueue_.push(text);
+    return !messageQueue_.empty();
+}
+
+// ============================================================
+// popMessage: lấy 1 message từ queue (non-blocking)
+// ============================================================
+bool ChatClient::popMessage(std::string& outMsg) {
+    std::lock_guard<std::mutex> lock(messageQueueMutex_);
+    if (messageQueue_.empty()) {
+        return false;
+    }
+    outMsg = messageQueue_.front();
+    messageQueue_.pop();
+    return true;
+}
+
+// ============================================================
+// setMessageCallback: đăng ký callback
+// ============================================================
+void ChatClient::setMessageCallback(std::function<void(const std::string&)> cb) {
+    messageCallback_ = std::move(cb);
 }
